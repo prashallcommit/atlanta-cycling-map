@@ -12,7 +12,8 @@
     --lane-buffered:  #2a78d6;
     --lane-standard:  #e8730c;
     --lane-trail:     #7b3fbf;
-    --lane-sharrow:   #8a8f98;
+    --lane-sharrow:   #5b6470;   /* dark slate, long dashes — distinct from the pale dotted neighborhoods */
+    --nb-boundary:    #b9bec6;
     /* Risk / status (reserved, never reused for series) */
     --risk-low:      #fab219;
     --risk-med:      #ec835a;
@@ -200,7 +201,7 @@
 
   <div class="section">
     <h2>Overlays</h2>
-    <label class="toggle"><input type="checkbox" data-layer="neighborhoods" checked><span class="swatch dotted" style="border-color:#9aa0a6"></span>Neighborhood boundaries</label>
+    <label class="toggle"><input type="checkbox" data-layer="neighborhoods" checked><span class="swatch dotted" style="border-color:var(--nb-boundary)"></span>Neighborhood boundaries</label>
     <label class="toggle"><input type="checkbox" data-layer="marta"><span class="chip">🚇</span>MARTA stations</label>
   </div>
 
@@ -255,7 +256,7 @@
       <div class="row"><span class="swatch" style="border-color:var(--lane-buffered)"></span>Buffered lane</div>
       <div class="row"><span class="swatch" style="border-color:var(--lane-standard)"></span>Standard lane</div>
       <div class="row"><span class="swatch dashed" style="border-color:var(--lane-sharrow)"></span>Sharrow</div>
-      <div class="row"><span class="swatch dotted" style="border-color:#9aa0a6"></span>Neighborhood</div>
+      <div class="row"><span class="swatch dotted" style="border-color:var(--nb-boundary)"></span>Neighborhood</div>
       <div class="row"><span class="dot" style="background:var(--risk-low)"></span>Crash risk: low</div>
       <div class="row"><span class="dot" style="background:var(--risk-med)"></span>Crash risk: medium</div>
       <div class="row"><span class="dot" style="background:var(--risk-high)"></span>Crash risk: high</div>
@@ -553,7 +554,9 @@ const REAL_SAFETY = CRASHES !== SAMPLE_CRASHES;
 /* =====================================================================
    MAP SETUP
    ===================================================================== */
-const map = L.map('map', { zoomControl: false }).setView([33.7650, -84.3800], 13);
+// preferCanvas: with the metro-wide network (~10k+ polylines) canvas rendering
+// keeps panning/zooming smooth where SVG would crawl.
+const map = L.map('map', { zoomControl: false, preferCanvas: true }).setView([33.7650, -84.3800], 13);
 L.control.zoom({ position: 'topright' }).addTo(map);
 
 const baseLight = L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
@@ -578,7 +581,7 @@ const LANE_STYLE = {
   protected: { weight: 2.5, opacity: 0.9 },
   buffered:  { weight: 2.5, opacity: 0.9 },
   standard:  { weight: 2.5, opacity: 0.9 },
-  sharrow:   { weight: 2,   opacity: 0.85, dashArray: '5 7' }
+  sharrow:   { weight: 2.5, opacity: 0.9, dashArray: '9 6' }
 };
 const LANE_COLOR = {
   trail: getCss('--lane-trail'), protected: getCss('--lane-protected'),
@@ -642,7 +645,7 @@ map.on('zoomend', syncNbLabels);
 syncNbLabels();
 NEIGHBORHOODS.forEach(n => {
   const poly = L.polygon(n.coords, {
-    color: '#9aa0a6', weight: 1.5, dashArray: '2 6', fill: true,
+    color: getCss('--nb-boundary'), weight: 1, dashArray: '1 4', fill: true,
     fillOpacity: 0.02, interactive: false
   });
   const center = poly.getBounds().getCenter();

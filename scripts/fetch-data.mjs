@@ -142,6 +142,19 @@ export function polyOuterRing(geometry, maxPts = 160) {
 
 export function round5(x) { return Math.round(x * 1e5) / 1e5; }
 
+// Ray-casting point-in-polygon over a set of [lat,lng] rings (XOR handles holes).
+export function pointInRings(pt, rings) {
+  let inside = false;
+  for (const ring of rings) {
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      const [yi, xi] = ring[i], [yj, xj] = ring[j];
+      if (((yi > pt[0]) !== (yj > pt[0])) && (pt[1] < (xj - xi) * (pt[0] - yi) / (yj - yi) + xi))
+        inside = !inside;
+    }
+  }
+  return inside;
+}
+
 export function haversineKm([lat1, lng1], [lat2, lng2]) {
   const R = 6371, d = Math.PI / 180;
   const a = Math.sin((lat2 - lat1) * d / 2) ** 2 +
@@ -391,32 +404,49 @@ function writeDataFile(outDir, name, banner, assignments) {
 /* ============================== pipelines ============================== */
 
 // Fetch one bike-facility layer and convert its features to route objects.
-async function routesFromLayer(queryUrl, { note, dropCityAtlanta = false } = {}) {
+// dropInsideRings: [lat,lng] rings (e.g. Atlanta city limits) — segments whose
+// midpoint falls inside are dropped (covered by the richer city layer).
+async function routesFromLayer(queryUrl, { note, dropCityAtlanta = false, dropInsideRings = null } = {}) {
   const feats = await fetchArcGISAll(queryUrl);
   if (!feats.length) throw new Error('layer returned no features');
   const props0 = feats.find(f => f.properties)?.properties || {};
-  const NO_ID = /(^|_)(object)?id$|^fid$/i;   // never pick OBJECTID / FACILITYID / *_ID as a value field
+  // never pick OBJECTID / FACILITYID / *_ID, nor REC_* (recommended/planned) fields
+  const NO_ID = /(^|_)(object)?id$|^fid$|^rec_/i;
   const typeField = pickField(props0,
-    [/fac.*type|type.*fac/i, /bike.*type|type.*bike/i, /lane.*type|type.*lane/i, /spec/i, /^type$/i, /class$/i, /category/i, /^facility$/i, /status/i],
+    [/fac.*type|type.*fac/i, /^bicycle_?facility$/i, /bike.*type|type.*bike/i, /lane.*type|type.*lane/i, /spec/i, /^type$/i, /class$/i, /category/i, /^facility$/i],
     NO_ID);
   const nameField = pickField(props0,
     [/st_?name|street.*name|name.*street/i, /road.*name|name.*road/i, /^street$/i, /^road$/i, /route.*name/i, /fac.*name|name.*fac/i, /^name$/i, /corridor/i, /label/i],
     NO_ID);
   const cityField = dropCityAtlanta ? pickField(props0, [/^city/i, /city.*(name|loc)/i, /jurisdiction/i], NO_ID) : null;
+  // Existing vs programmed/planned marker (ARC's LINE_TYPE and similar)
+  const statusCandidate = pickField(props0, [/line_?type/i, /existing/i, /^status$/i], NO_ID);
+  const statusField = statusCandidate !== typeField ? statusCandidate : null;
   console.log(`  fields available: ${Object.keys(props0).join(', ')}`);
   console.log(`  detected fields → type: ${typeField ?? '(none)'} · name: ${nameField ?? '(none)'}` +
+    ` · status: ${statusField ?? '(none)'}` +
     (dropCityAtlanta ? ` · city: ${cityField ?? '(none)'}` : ''));
 
-  const seenTypes = new Map();
+  const seenTypes = new Map(), seenStatus = new Map();
   const routes = [];
-  let droppedCity = 0;
+  let droppedCity = 0, droppedPlanned = 0, droppedInside = 0;
   for (const f of feats) {
     const p = f.properties || {};
     if (cityField && /^atlanta$/i.test(String(p[cityField] || '').trim())) { droppedCity++; continue; }
+    if (statusField) {
+      const sv = String(p[statusField] ?? '');
+      seenStatus.set(sv, (seenStatus.get(sv) || 0) + 1);
+      if (/programmed|planned|proposed|future|conceptual|recommend|vision|funded/i.test(sv)) { droppedPlanned++; continue; }
+    }
     const rawType = typeField ? p[typeField] : null;
+    const lines = geomToLines(f.geometry);
+    if (dropInsideRings && lines.length) {
+      const mid = lines[0][Math.floor(lines[0].length / 2)];
+      if (pointInRings(mid, dropInsideRings)) { droppedInside++; continue; }
+    }
     seenTypes.set(rawType, (seenTypes.get(rawType) || 0) + 1);
     const type = classifyFacility(rawType) || 'standard';
-    for (const coords of geomToLines(f.geometry)) {
+    for (const coords of lines) {
       if (coords.length < 2) continue;
       routes.push({
         name: (nameField && p[nameField]) ? titleCase(p[nameField]) : (rawType ? String(rawType) : 'Bike facility'),
@@ -429,10 +459,29 @@ async function routesFromLayer(queryUrl, { note, dropCityAtlanta = false } = {})
     }
   }
   if (droppedCity) console.log(`  dropped ${droppedCity} City-of-Atlanta rows (covered by the city layer)`);
+  if (droppedInside) console.log(`  dropped ${droppedInside} segments inside the city limits polygon (covered by the city layer)`);
+  if (droppedPlanned) console.log(`  dropped ${droppedPlanned} programmed/planned (not yet built) segments`);
+  if (seenStatus.size) console.log('  status values seen:', [...seenStatus].map(([v, n]) => `${v}×${n}`).join(' | '));
   console.log('  facility-type values seen:');
   for (const [v, n] of [...seenTypes].sort((a, b) => b[1] - a[1]))
     console.log(`    ${String(v)} × ${n} → ${classifyFacility(v) || 'standard (unmapped!)'}`);
   return routes;
+}
+
+// Official City of Atlanta boundary as [lat,lng] rings (for the spatial dedupe).
+async function fetchCityLimitRings() {
+  const feats = await fetchArcGISAll('https://gis.atlantaga.gov/dpcd/rest/services/OpenDataService1/MapServer/1/query');
+  const rings = [];
+  for (const f of feats) {
+    const g = f.geometry;
+    if (!g) continue;
+    const polys = g.type === 'Polygon' ? [g.coordinates] : g.type === 'MultiPolygon' ? g.coordinates : [];
+    for (const poly of polys)
+      for (const ring of poly)
+        rings.push(ring.map(([lng, lat]) => [lat, lng]));
+  }
+  if (!rings.length) throw new Error('city limits layer returned no polygon rings');
+  return rings;
 }
 
 async function pipelineInfrastructure(outDir, infraUrlOverride) {
@@ -453,10 +502,14 @@ async function pipelineInfrastructure(outDir, infraUrlOverride) {
   try {
     const arcUrl = await discoverLayer(SOURCES.arcRegionalCatalogs, /./, null);
     if (!arcUrl) throw new Error('no layer found in ARC service');
+    let cityRings = null;
+    try { cityRings = await fetchCityLimitRings(); console.log(`  city-limits polygon loaded (${cityRings.length} rings) for spatial dedupe`); }
+    catch (e) { console.warn(`  ⚠ city-limits fetch failed (${e.message}) — regional rows inside the city may double-draw`); }
     console.log(`  querying ${arcUrl}`);
     const regional = await routesFromLayer(arcUrl, {
       note: 'Regional inventory (ARC) — outside the City of Atlanta',
-      dropCityAtlanta: true
+      dropCityAtlanta: true,
+      dropInsideRings: cityRings
     });
     console.log(`  ${regional.length} regional segments added to ${routes.length} city segments`);
     routes.push(...regional);
@@ -569,6 +622,11 @@ function selftest() {
   eq('classify contraflow buffered', classifyFacility('Buffered Contraflow Bike Lane'), 'buffered');
   eq('classify multiuse-hard', classifyFacility('Hard Surface Multi-Use Path'), 'trail');
   eq('classify bike-blvd', classifyFacility('Bike Boulevard'), 'sharrow');
+
+  const sq = [[[33.70, -84.45], [33.90, -84.45], [33.90, -84.30], [33.70, -84.30], [33.70, -84.45]]];
+  eq('pip inside', pointInRings([33.80, -84.40], sq), true);
+  eq('pip outside', pointInRings([33.60, -84.40], sq), false);
+  eq('pickField skips REC_', pickField({ REC_BICYCLE_FACILITY: 'x', BICYCLE_FACILITY: 'y' }, [/bicycle_?facility/i], /(^|_)(object)?id$|^fid$|^rec_/i), 'BICYCLE_FACILITY');
   eq('classify unknown', classifyFacility('Widget'), null);
   eq('surface trail', inferSurface('trail'), 'Paved (some interim unpaved segments possible)');
   eq('surface lane', inferSurface('standard'), 'Paved (asphalt)');
