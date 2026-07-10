@@ -80,9 +80,8 @@ jobs:
       - name: Assemble site
         run: |
           mkdir -p _site
-          cp index.html _site/
-          cp -r vendor _site/
-          cp -r data _site/
+          cp index.html manifest.webmanifest sw.js _site/
+          cp -r vendor data icons _site/
           touch _site/.nojekyll   # serve files as-is, no Jekyll processing
 
       - name: Configure Pages (auto-enables it on first run)

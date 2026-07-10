@@ -9,6 +9,9 @@
 <meta property="og:description" content="Every bike lane and trail across metro Atlanta, with real crash-safety data. Built from official City of Atlanta and ARC GIS sources.">
 <meta property="og:type" content="website">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚲</text></svg>">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#2a78d6">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
 <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
 <style>
   :root {
@@ -232,6 +235,7 @@
   <div class="section">
     <h2>Overlays</h2>
     <label class="toggle"><input type="checkbox" data-layer="neighborhoods" checked><span class="swatch dotted" style="border-color:var(--nb-boundary)"></span>Neighborhood &amp; metro city boundaries</label>
+    <label class="toggle"><input type="checkbox" data-layer="scores"><span class="dot" style="background:linear-gradient(90deg,#cde2fb,#184f95)"></span>Bike-friendliness score</label>
     <label class="toggle"><input type="checkbox" data-layer="marta"><span class="chip">🚇</span>MARTA stations</label>
   </div>
 
@@ -295,6 +299,7 @@
       <div class="row"><span class="dot" style="background:var(--risk-low)"></span>Crash risk: low</div>
       <div class="row"><span class="dot" style="background:var(--risk-med)"></span>Crash risk: medium</div>
       <div class="row"><span class="dot" style="background:var(--risk-high)"></span>Crash risk: high</div>
+      <div class="row"><span style="width:22px;height:8px;border-radius:2px;background:linear-gradient(90deg,#cde2fb,#184f95);flex:none"></span>Friendliness low→high</div>
     </div>
   </div>
 </div>
@@ -309,6 +314,7 @@
 <script src="data/neighborhoods.js"></script>
 <script src="data/safety.js"></script>
 <script src="data/pois.js"></script>
+<script src="data/scores.js"></script>
 <script>
 'use strict';
 
@@ -661,7 +667,8 @@ const layers = {
   neighborhoods: L.layerGroup(), marta: L.layerGroup(),
   parks: L.layerGroup(), access: L.layerGroup(), shops: L.layerGroup(),
   food: L.layerGroup(), landmarks: L.layerGroup(),
-  crashBike: L.layerGroup(), crashScooter: L.layerGroup(), corridors: L.layerGroup()
+  crashBike: L.layerGroup(), crashScooter: L.layerGroup(), corridors: L.layerGroup(),
+  scores: L.layerGroup()
 };
 
 const HILL_ICON = { Flat: '🟢', Rolling: '🟡', Hilly: '🔴' };
@@ -678,7 +685,7 @@ ROUTES.forEach(r => {
     <span class="popup-tag" style="background:${LANE_COLOR[type]}">${LANE_LABEL[type]}</span>
     <div class="popup-grid">
       <span class="k">🛣️</span><span><b>Surface:</b> ${esc(r.surface || 'Paved (assumed)')}</span>
-      ${r.hills ? `<span class="k">${HILL_ICON[r.hills] || '⛰️'}</span><span><b>Hilliness:</b> ${esc(r.hills)}</span>` : ''}
+      ${r.hills ? `<span class="k">${HILL_ICON[r.hills] || '⛰️'}</span><span><b>Hilliness:</b> ${esc(r.hills)}${r.grade != null ? ` (≈${r.grade}% max grade)` : ''}</span>` : ''}
       ${r.lighting ? `<span class="k">🌙</span><span><b>Lighting:</b> ${esc(r.lighting)}</span>` : ''}
       ${marta ? `<span class="k">🚇</span><span><b>MARTA:</b> ${marta}</span>` : ''}
     </div>
@@ -772,6 +779,33 @@ Object.keys(POI_EMOJI).forEach(cat => {
     layers[cat].addLayer(m);
   });
 });
+
+/* ---------- Bike-friendliness choropleth ---------- */
+// Sequential blue ramp (light = low, dark = high score).
+const SCORE_RAMP = ['#cde2fb', '#9ec5f4', '#5598e7', '#2a78d6', '#184f95'];
+const scoreColor = s => SCORE_RAMP[Math.min(4, Math.floor(s / 20))];
+(function buildScores() {
+  const scores = D.scores || [];
+  if (!scores.length) return;
+  const byName = new Map(scores.map(s => [s.name, s]));
+  NEIGHBORHOODS.forEach(n => {
+    const s = byName.get(n.name);
+    if (!s) return;
+    const poly = L.polygon(n.coords, {
+      color: '#fff', weight: 1, fillColor: scoreColor(s.score), fillOpacity: 0.55
+    });
+    poly.bindPopup(`
+      <h4>${esc(n.name)}</h4>
+      <span class="popup-tag" style="background:${scoreColor(s.score)}">Bike-friendliness ${s.score}/100</span>
+      <div class="popup-grid">
+        <span class="k">🛣️</span><span><b>${s.laneKm}</b> km of bike facilities (${s.protKm} km protected/trail)</span>
+        <span class="k">💥</span><span><b>${s.crashes}</b> crashes (2021–2025)</span>
+      </div>
+      <div class="popup-note">Score = facility density (45%) + protected/trail density (35%) + inverse crash density (20%), percentile-ranked citywide.</div>`,
+      { maxWidth: 280 });
+    layers.scores.addLayer(poly);
+  });
+})();
 
 /* ---------- Safety layer ---------- */
 const SEV_LABEL = { low: 'Low', med: 'Medium', high: 'High' };
@@ -1015,6 +1049,11 @@ map.on('click', () => document.getElementById('sidebar').classList.remove('open'
   });
   document.getElementById('trendChart').appendChild(svg);
 })();
+
+/* ---------- PWA: installable app + offline shell ---------- */
+if ('serviceWorker' in navigator && location.protocol === 'https:') {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
 </script>
 </body>
 </html>

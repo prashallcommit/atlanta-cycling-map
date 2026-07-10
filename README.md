@@ -28,6 +28,9 @@ viewers just open the link; all data loads automatically.
 ### 📍 Getting around
 - **Map / Satellite** basemap switcher (CARTO light + Esri World Imagery).
 - **GPS locate button** — see yourself on the map while riding.
+- **Installable app (PWA)** — add to home screen; the app shell and last-seen data work offline.
+- **Bike-friendliness choropleth** — every neighborhood scored 0–100 from facility density, protected/trail share, and crash density.
+- **Honest hilliness** — each route graded Flat / Rolling / Hilly from real elevation data, with max grade in the popup.
 - Search bar: neighborhoods, places, and street addresses (Nominatim).
 - **Casual ride / Commuter** presets that flip layer combinations.
 - Official **neighborhood boundaries** (248 polygons; labels appear as you zoom).
@@ -59,7 +62,9 @@ and the map notes what's missing rather than breaking.
 | Neighborhoods | ✅ Official city boundaries, auto-refreshed |
 | Crash data | ✅ Real GDOT/APD export (2021–2025), committed in `data/` |
 | Bike shops | ✅ OpenStreetMap, auto-refreshed |
-| Lighting / hilliness | ❌ No official source publishes these — omitted rather than guessed |
+| Hilliness | ✅ Computed per route from Open-Meteo elevation samples (steepest sustained grade) |
+| Bike-friendliness scores | ✅ Computed per neighborhood: facility density (45%) + protected/trail density (35%) + inverse crash density (20%), percentile-ranked |
+| Lighting | ❌ No official source publishes it — omitted rather than guessed |
 
 Notes: FARS (NHTSA) fatal-crash fetching exists (`--fars`) but NHTSA blocks
 GitHub's runner IPs, so run it locally if wanted. Relay Bike Share shut down

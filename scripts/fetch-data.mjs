@@ -162,6 +162,32 @@ export function haversineKm([lat1, lng1], [lat2, lng2]) {
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
+export function lineKm(coords) {
+  let s = 0;
+  for (let i = 1; i < coords.length; i++) s += haversineKm(coords[i - 1], coords[i]);
+  return s;
+}
+
+// n points evenly spaced along the coordinate list (always includes both ends)
+export function sampleEvenly(coords, n) {
+  if (coords.length <= n) return coords.slice();
+  const out = [];
+  for (let i = 0; i < n; i++) out.push(coords[Math.round(i * (coords.length - 1) / (n - 1))]);
+  return out;
+}
+
+export function gradeClass(g) { return g < 0.02 ? 'Flat' : g < 0.045 ? 'Rolling' : 'Hilly'; }
+
+// steepest sustained grade between consecutive samples (ignore <50 m hops)
+export function maxGrade(samples, elevs) {
+  let g = 0;
+  for (let i = 1; i < samples.length; i++) {
+    const d = haversineKm(samples[i - 1], samples[i]) * 1000;
+    if (d > 50) g = Math.max(g, Math.abs(elevs[i] - elevs[i - 1]) / d);
+  }
+  return g;
+}
+
 export function nearestMarta(coords, maxKm = 1.3, maxN = 2) {
   const mid = coords[Math.floor(coords.length / 2)];
   return MARTA
@@ -477,6 +503,47 @@ async function routesFromLayer(queryUrl, { note, dropCityAtlanta = false, dropIn
   return routes;
 }
 
+// Honest hilliness: sample each route against the Open-Meteo elevation API
+// (free, 100 coords per request) and grade by steepest sustained slope.
+// Partial results are kept if the API cuts out mid-way.
+async function enrichElevation(routes) {
+  console.log('▶ Hilliness — Open-Meteo elevation API');
+  const perRoute = [], flat = [];
+  for (const r of routes) {
+    const km = lineKm(r.coords);
+    const n = Math.max(3, Math.min(6, Math.ceil(km / 1.5) + 1));
+    const s = sampleEvenly(r.coords, n);
+    perRoute.push(s);
+    flat.push(...s);
+  }
+  console.log(`  ${routes.length} routes → ${flat.length} sample points (${Math.ceil(flat.length / 100)} requests)`);
+  const elev = new Array(flat.length);
+  try {
+    for (let i = 0; i < flat.length; i += 100) {
+      const batch = flat.slice(i, i + 100);
+      const url = 'https://api.open-meteo.com/v1/elevation?latitude=' +
+        batch.map(p => p[0]).join(',') + '&longitude=' + batch.map(p => p[1]).join(',');
+      const j = await getJSON(url);
+      (j.elevation || []).forEach((e, k) => { elev[i + k] = e; });
+      if ((i / 100) % 50 === 0) process.stdout.write(`  …${i + batch.length}/${flat.length} points\r`);
+    }
+  } catch (e) {
+    console.warn(`  ⚠ elevation fetch stopped early (${e.message}) — keeping partial results`);
+  }
+  let idx = 0, assigned = 0;
+  routes.forEach((r, ri) => {
+    const s = perRoute[ri];
+    const es = elev.slice(idx, idx + s.length);
+    idx += s.length;
+    if (es.some(e => e == null || !isFinite(e))) return;
+    const g = maxGrade(s, es);
+    r.hills = gradeClass(g);
+    r.grade = Math.round(g * 1000) / 10;
+    assigned++;
+  });
+  console.log(`  hills assigned on ${assigned}/${routes.length} routes`);
+}
+
 // Official City of Atlanta boundary as [lat,lng] rings (for the spatial dedupe).
 async function fetchCityLimitRings() {
   const feats = await fetchArcGISAll('https://gis.atlantaga.gov/dpcd/rest/services/OpenDataService1/MapServer/1/query');
@@ -493,7 +560,7 @@ async function fetchCityLimitRings() {
   return rings;
 }
 
-async function pipelineInfrastructure(outDir, infraUrlOverride) {
+async function pipelineInfrastructure(outDir, infraUrlOverride, skipElevation = false) {
   console.log('▶ Bike infrastructure — City of Atlanta GIS (auto-discovering bike layer)');
   const cityUrl = infraUrlOverride ||
     await discoverLayer(SOURCES.bikeServiceCatalogs, SOURCES.bikeNameRe, SOURCES.bikeExcludeRe);
@@ -540,8 +607,13 @@ async function pipelineInfrastructure(outDir, infraUrlOverride) {
     console.warn(`  ⚠ regional layer skipped: ${e.message} (city coverage still complete)`);
   }
 
+  if (!skipElevation) {
+    try { await enrichElevation(routes); }
+    catch (e) { console.warn(`  ⚠ hilliness skipped: ${e.message}`); }
+  }
+
   writeDataFile(outDir, 'infrastructure.js',
-    'Sources: City of Atlanta DPCD GIS (Bicycle Routes) + ARC Regional Bikeway Inventory (metro)',
+    'Sources: City of Atlanta DPCD GIS (Bicycle Routes) + ARC Regional Bikeway Inventory (metro); hilliness from Open-Meteo elevation',
     [['routes', routes]]);
 }
 
@@ -550,6 +622,68 @@ const OVERPASS_ENDPOINTS = [
   'https://overpass.kumi.systems/api/interpreter',
   'https://overpass.private.coffee/api/interpreter'
 ];
+
+// Pull a JSON array back out of a generated data file.
+function readDataArray(outDir, file, key) {
+  const p = join(outDir, file);
+  const txt = readFileSync(p, 'utf8');
+  const m = txt.match(new RegExp('window\\.ATL_DATA\\.' + key + ' = (\\[[\\s\\S]*?\\]);\\n'));
+  return m ? JSON.parse(m[1]) : null;
+}
+
+// Neighborhood bike-friendliness: percentile-ranked blend of facility density
+// (45%), protected/trail density (35%), and inverse crash density (20%).
+// Fully derived from data already in outDir — no network needed.
+async function pipelineScores(outDir) {
+  console.log('▶ Neighborhood bike-friendliness scores (computed)');
+  const nbs = readDataArray(outDir, 'neighborhoods.js', 'neighborhoods');
+  const routes = readDataArray(outDir, 'infrastructure.js', 'routes');
+  const crashes = readDataArray(outDir, 'safety.js', 'crashes') || [];
+  if (!nbs || !routes) throw new Error('run infrastructure + neighborhoods first');
+  // ring area in km² via shoelace (deg² scaled at Atlanta's latitude)
+  const areaKm2 = ring => {
+    let a = 0;
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++)
+      a += ring[j][1] * ring[i][0] - ring[i][1] * ring[j][0];
+    return Math.abs(a / 2) * 110.6 * 92.6;
+  };
+  const stats = nbs.map(n => ({
+    n, area: Math.max(areaKm2(n.coords), 0.05), laneKm: 0, protKm: 0, crashes: 0,
+    bbox: [Math.min(...n.coords.map(p => p[0])), Math.max(...n.coords.map(p => p[0])),
+           Math.min(...n.coords.map(p => p[1])), Math.max(...n.coords.map(p => p[1]))]
+  }));
+  const inBB = (p, b) => p[0] >= b[0] && p[0] <= b[1] && p[1] >= b[2] && p[1] <= b[3];
+  for (const r of routes) {
+    const mid = r.coords[Math.floor(r.coords.length / 2)];
+    for (const s of stats) {
+      if (!inBB(mid, s.bbox) || !pointInRings(mid, [s.n.coords])) continue;
+      const km = lineKm(r.coords);
+      s.laneKm += km;
+      if (r.type === 'protected' || r.type === 'trail') s.protKm += km;
+      break;
+    }
+  }
+  for (const c of crashes) {
+    for (const s of stats) {
+      if (!inBB([c.lat, c.lng], s.bbox) || !pointInRings([c.lat, c.lng], [s.n.coords])) continue;
+      s.crashes += c.n;
+      break;
+    }
+  }
+  const pct = vals => { const so = [...vals].sort((a, b) => a - b); return v => so.findIndex(x => x >= v) / Math.max(so.length - 1, 1); };
+  const fd = stats.map(s => s.laneKm / s.area), pd = stats.map(s => s.protKm / s.area), cd = stats.map(s => s.crashes / s.area);
+  const rf = pct(fd), rp = pct(pd), rc = pct(cd);
+  const scores = stats.map((s, i) => ({
+    name: s.n.name,
+    score: Math.round(100 * (0.45 * rf(fd[i]) + 0.35 * rp(pd[i]) + 0.20 * (1 - rc(cd[i])))),
+    laneKm: Math.round(s.laneKm * 10) / 10, protKm: Math.round(s.protKm * 10) / 10,
+    crashes: s.crashes, areaKm2: Math.round(s.area * 10) / 10
+  }));
+  console.log('  top 5:', scores.slice().sort((a, b) => b.score - a.score).slice(0, 5).map(s => `${s.name} ${s.score}`).join(' | '));
+  writeDataFile(outDir, 'scores.js',
+    'Computed: facility density (45%) + protected/trail density (35%) + inverse crash density (20%), percentile-ranked across neighborhoods.',
+    [['scores', scores]]);
+}
 
 async function pipelineShops(outDir) {
   console.log('▶ Bike shops — OpenStreetMap via Overpass API (metro-wide)');
@@ -742,6 +876,13 @@ function selftest() {
   eq('classify nbhd bikeway', classifyFacility('Neighborhood Bikeway'), 'sharrow');
   eq('classify protected one-way', classifyFacility('Bike Lane - Protected One-Way'), 'protected');
   eq('classify trail unpaved', classifyFacility('Trail - Unpaved'), 'trail');
+  eq('sample evenly ends', sampleEvenly([[1,1],[2,2],[3,3],[4,4],[5,5]], 3), [[1,1],[3,3],[5,5]]);
+  eq('grade flat', gradeClass(0.01), 'Flat');
+  eq('grade rolling', gradeClass(0.03), 'Rolling');
+  eq('grade hilly', gradeClass(0.06), 'Hilly');
+  // 33.7,-84.4 → 33.7,-84.39 is ~925 m; 30 m rise ≈ 3.2% grade
+  eq('maxGrade ~3%', Math.round(maxGrade([[33.7,-84.4],[33.7,-84.39]], [280, 310]) * 1000) / 10, 3.2);
+  eq('lineKm ~0.9', Math.round(lineKm([[33.7,-84.4],[33.7,-84.39]]) * 10) / 10, 0.9);
   eq('classify unknown', classifyFacility('Widget'), null);
   eq('surface trail', inferSurface('trail'), 'Paved (some interim unpaved segments possible)');
   eq('surface lane', inferSurface('standard'), 'Paved (asphalt)');
@@ -800,6 +941,8 @@ function parseArgs(argv) {
     else if (v === '--skip-infra') a.skipInfra = true;
     else if (v === '--skip-neighborhoods') a.skipNb = true;
     else if (v === '--skip-shops') a.skipShops = true;
+    else if (v === '--skip-elevation') a.skipElevation = true;
+    else if (v === '--skip-scores') a.skipScores = true;
     else if (v === '--selftest') a.selftest = true;
     else if (v === '--help' || v === '-h') { console.log(readFileSync(fileURLToPath(import.meta.url), 'utf8').split('*/')[0] + '*/'); process.exit(0); }
     else throw new Error(`unknown arg: ${v}`);
@@ -819,9 +962,10 @@ if (isMain) {
         try { await fn(); }
         catch (e) { failures++; console.error(`✖ ${what} failed: ${e.message}`); }
       };
-      await step(args.skipInfra, () => pipelineInfrastructure(args.out, args.infraUrl), 'infrastructure');
+      await step(args.skipInfra, () => pipelineInfrastructure(args.out, args.infraUrl, args.skipElevation), 'infrastructure');
       await step(args.skipNb, () => pipelineNeighborhoods(args.out), 'neighborhoods');
       await step(args.skipShops, () => pipelineShops(args.out), 'bike shops');
+      await step(args.skipScores, () => pipelineScores(args.out), 'friendliness scores');
       if (args.gdotCsv) await step(false, () => pipelineGdotCsv(args.out, args.gdotCsv, args.years, args.map, args.assumeBike), 'GDOT CSV');
       else if (args.fars) await step(false, () => pipelineFars(args.out, args.years), 'FARS');
       else console.log('ℹ No crash source given — pass --gdot-csv <file> (best) or --fars (fatalities only).');
