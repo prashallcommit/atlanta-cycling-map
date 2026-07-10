@@ -218,7 +218,6 @@
     <span>Colors:</span>
     <button data-theme="classic" class="active">Classic</button>
     <button data-theme="braves" title="Navy, scarlet &amp; metallic gold">Braves</button>
-    <button data-theme="hawks" title="Torch red, volt green &amp; charcoal">Hawks</button>
   </div>
 
   <div class="section">
@@ -642,8 +641,7 @@ const LANE_STYLE = {
 // each club's official colors (+ tints where a team has fewer than 5 colors).
 const THEMES = {
   classic: { trail: '#7b3fbf', protected: '#1a9850', buffered: '#2a78d6', standard: '#e8730c', sharrow: '#5b6470' },
-  braves:  { trail: '#13274F', protected: '#4A77BE', buffered: '#B5985A', standard: '#CE1141', sharrow: '#5b6470' },
-  hawks:   { trail: '#26282A', protected: '#8CA309', buffered: '#8E9AA3', standard: '#E03A3E', sharrow: '#5b6470' }
+  braves:  { trail: '#13274F', protected: '#4A77BE', buffered: '#B5985A', standard: '#CE1141', sharrow: '#5b6470' }
 };
 const LANE_COLOR = Object.assign({}, THEMES.classic);
 const ROUTE_LINES = [];   // { line, type } — restyled on theme switch
